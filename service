@@ -1,0 +1,214 @@
+#!/usr/bin/python
+import os
+import re
+import traceback
+import threading
+import time
+import json
+import sys
+import pytz
+from calendar import timegm
+from datetime import datetime, timedelta
+from select import select
+from evdev import ecodes, InputDevice, list_devices
+from evdev.events import KeyEvent
+from hosted import config, node, device
+from ibquery import InfoBeamerQuery
+
+config.restart_on_update()
+
+schedule_tz = pytz.timezone(config.timezone)
+
+def iter_tiles(types=None):
+    for schedule in config.schedules:
+        for page in schedule['pages']:
+            for tile in page['tiles']:
+                if not types or tile['type'] in types:
+                    yield tile
+    for layout in config.layouts:
+        for tile in layout['tiles']:
+            if not types or tile['type'] in types:
+                yield tile
+
+all_timezones = {
+    schedule_tz.zone: schedule_tz,
+}
+for tile in iter_tiles('time'):
+    tile_tz = tile['config'].get('timezone')
+    if tile_tz:
+        all_timezones[tile_tz] = pytz.timezone(tile_tz)
+print >>sys.stderr, all_timezones
+
+countdowns = set()
+for tile in iter_tiles('countdown'):
+    countdowns.add(tile['config'].get('target', ''))
+print >>sys.stderr, countdowns
+
+
+try:
+    sim_date, sim_time = config.time.strip().split()
+    d, m, y = sim_date.split('.')
+    ho, mi = sim_time.split(':')
+
+    utc_now = datetime.now(pytz.utc)
+    local_now = utc_now.astimezone(schedule_tz)
+    simulated = schedule_tz.localize(datetime(int(y), int(m), int(d), int(ho), int(mi), 00))
+
+    diff =  simulated - local_now
+except:
+    diff = timedelta()
+
+print >>sys.stderr, "timedelta for simulation: %r" % (diff,)
+
+devices = {}
+def update_devices():
+    new = set(list_devices("/dev/input/"))
+    old = set(devices.keys())
+
+    for device_name in new - old:
+        devices[device_name] = InputDevice(device_name)
+
+    for device_name in old - new:
+        del devices[device_name]
+
+def send_clock(tz):
+    utc_now = datetime.now(pytz.utc) + diff
+
+    unix = timegm(utc_now.timetuple()) + utc_now.microsecond / 1000000.
+    local_now = utc_now.astimezone(tz)
+    # print >>sys.stderr, 'local now', local_now
+
+    since_midnight = (
+        local_now -
+        local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+    since_midnight = since_midnight.seconds + since_midnight.microseconds / 1000000.
+
+    monday = (local_now - timedelta(days = local_now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    since_monday = local_now - monday
+    since_monday = since_monday.days * 86400 + since_monday.seconds + since_monday.microseconds / 1000000.
+
+    node['/clock/%s' % tz.zone](json.dumps(dict(
+        year = local_now.year,
+        month = local_now.month,
+        day = local_now.day,
+        unix = unix,
+        dow = local_now.weekday(),
+        since_midnight = since_midnight,
+        since_monday = int(since_monday),
+        week_hour = int(since_monday / 3600),
+        diff = diff.total_seconds(),
+    )))
+
+def send_countdown(countdown_target):
+    try:
+        target = datetime.strptime(countdown_target, "%Y-%m-%d %H:%M:%S")
+    except ValueError as err:
+        traceback.print_exc()
+        return
+    target = schedule_tz.localize(target)
+    target = target.astimezone(pytz.UTC)
+    unix = timegm(target.timetuple())
+    node['/countdown'](json.dumps(dict(
+        target = countdown_target,
+        unix = unix,
+    )))
+
+def device_event(event):
+    print >>sys.stderr, event
+
+    if event.code in ecodes.BTN:
+        btn = ecodes.BTN[event.code]
+        if not isinstance(btn, list):
+            btn = [btn]
+        for name in btn:
+            node.send('/event/pad:%s' % json.dumps(dict(
+                key = name.replace("BTN_", "pad_").lower(),
+                action = {
+                    KeyEvent.key_up: "up",
+                    KeyEvent.key_down: "down",
+                }[event.value],
+            )))
+    
+    if event.type == ecodes.EV_KEY and event.code in ecodes.KEY:
+        node.send('/event/keyboard:%s' % json.dumps(dict(
+            key = ecodes.KEY[event.code].replace("KEY_", "").lower(),
+            action = {
+                KeyEvent.key_up: "up",
+                KeyEvent.key_down: "down",
+                KeyEvent.key_hold: "hold",
+            }[event.value],
+        )))
+
+def monitor_input():
+    update_devices()
+    r, w, e = select(devices.values(), [], [], 1)
+    for event in r:
+        try:
+            for ev in event.read():
+                device_event(ev)
+        except IOError:
+            # device disconnected
+            pass
+
+def send_time():
+    if time.time() < 10000000:
+        print >>sys.stderr, "too soon"
+        time.sleep(1)
+        return
+    for name, tz in all_timezones.iteritems():
+        send_clock(tz)
+    for target in countdowns:
+        send_countdown(target)
+    time.sleep(0.5)
+
+def monitor_gpio():
+    pins = set()
+    for schedule in config.schedules:
+        for page in schedule['pages']:
+            key = page.get('interaction', {}).get('key', '')
+            m = re.match('gpio_(.*)', key)
+            if m:
+                pins.add(int(m.group(1)))
+    if not pins:
+        time.sleep(120)
+        return
+
+    print >>sys.stderr, "gpios active: %s" % (pins,)
+    for pin in pins:
+        device.gpio.monitor(pin)
+    for pin, high in device.gpio.poll_forever():
+        if high:
+            node.send('/event/gpio:%s' % json.dumps(dict(
+                pin = pin,
+            )))
+
+def screen_toggle():
+    ib = InfoBeamerQuery("127.0.0.1")
+    con = ib.node('root/__fallback__').io(raw=True)
+    for line in con:
+        line = line.strip()
+        print >>sys.stderr, "screen power: %s" % (not config.poweroff or line == "1",)
+        # device.screen(
+        #     on = not config.poweroff or line == "1"
+        # )
+
+def run_in_thread(fn):
+    def wrap():
+        try:
+            while 1:
+                fn()
+        except Exception:
+            traceback.print_exc()
+            os._exit(1)
+    thread = threading.Thread(target=wrap)
+    thread.daemon = True
+    thread.start()
+
+if __name__ == "__main__":
+    run_in_thread(send_time)
+    run_in_thread(screen_toggle)
+    run_in_thread(monitor_input)
+    run_in_thread(monitor_gpio)
+
+    while 1: time.sleep(1000)
